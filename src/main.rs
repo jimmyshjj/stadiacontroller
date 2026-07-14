@@ -115,9 +115,9 @@ async fn main() -> anyhow::Result<()> {
             // Forward vibrations from the ViGEm Xbox 360 virtual controller to
             // the Stadia controller.
             Some(Vibration { large_motor, small_motor }) = rx_vibration.recv() => {
-                controller
-                    .vibrate(large_motor, small_motor)
-                    .context("cannot forward vibration to Stadia controller")?;
+                if let Err(err) = controller.vibrate(large_motor, small_motor) {
+                    eprintln!("Failed to vibrate Stadia controller: {err}");
+                }
             },
         }
     }

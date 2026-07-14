@@ -41,28 +41,43 @@ use windows::{
 };
 
 /// A handle to a Stadia controller.
-pub struct Controller(Option<AcquiredController>);
+pub struct Controller {
+    inner: Option<AcquiredController>,
+    last_large_motor: u8,
+    last_small_motor: u8,
+}
 
 impl Controller {
     /// Creates a new [`Controller`] which is not connected to any device.
     pub const fn new() -> Self {
-        Controller(None)
+        Controller {
+            inner: None,
+            last_large_motor: 0,
+            last_small_motor: 0,
+        }
+    }
+
+    /// Disconnects the controller, resetting the internal handle.
+    pub fn disconnect(&mut self) {
+        self.inner = None;
+        self.last_large_motor = 0;
+        self.last_small_motor = 0;
     }
 
     /// Reads a new report sent by the controller.
     pub async fn read_report(&mut self) -> anyhow::Result<Report> {
         loop {
             // Obtain inner controller.
-            let inner = match &mut self.0 {
+            let inner = match &mut self.inner {
                 Some(inner) => inner,
                 None => loop {
                     match AcquiredController::acquire()
                         .context("cannot connect to Stadia controller")?
                     {
                         Some(inner) => {
-                            self.0 = Some(inner);
+                            self.inner = Some(inner);
 
-                            break unsafe { self.0.as_mut().unwrap_unchecked() };
+                            break unsafe { self.inner.as_mut().unwrap_unchecked() };
                         }
                         None => {
                             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -82,7 +97,9 @@ impl Controller {
                 Some(read_bytes) => read_bytes,
                 None => {
                     // Controller was disconnected; re-acquire it.
-                    self.0 = None;
+                    self.inner = None;
+                    self.last_large_motor = 0;
+                    self.last_small_motor = 0;
 
                     continue;
                 }
@@ -99,11 +116,22 @@ impl Controller {
 
     /// Makes the controller vibrate.
     pub fn vibrate(&mut self, large_motor: u8, small_motor: u8) -> anyhow::Result<()> {
-        if let Some(inner) = &mut self.0 {
-            write_overlapped(
+        if large_motor == self.last_large_motor && small_motor == self.last_small_motor {
+            return Ok(());
+        }
+        self.last_large_motor = large_motor;
+        self.last_small_motor = small_motor;
+
+        if let Some(inner) = &mut self.inner {
+            if let Err(err) = write_overlapped(
                 inner.device_handle(),
                 &[0x05, large_motor, large_motor, small_motor, small_motor],
-            )?;
+            ) {
+                self.inner = None;
+                self.last_large_motor = 0;
+                self.last_small_motor = 0;
+                return Err(err);
+            }
         }
 
         Ok(())
@@ -455,6 +483,24 @@ async fn read_overlapped(
         None
     }
 
+    struct ReadOverlappedGuard {
+        handle: HANDLE,
+        wait_handle: HANDLE,
+        tx_ptr: *mut (AtomicBool, oneshot::Sender<()>),
+    }
+
+    impl Drop for ReadOverlappedGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CancelIo(self.handle);
+                if self.wait_handle.0 != 0 {
+                    UnregisterWait(self.wait_handle);
+                }
+                take_sender(self.tx_ptr);
+            }
+        }
+    }
+
     unsafe extern "system" fn done_waiting(ctx: *mut c_void, _: BOOLEAN) {
         let Some(sender) = take_sender(ctx.cast()) else { return };
         let _ = sender.send(());
@@ -511,27 +557,15 @@ async fn read_overlapped(
         )
     }
 
-    // If the current read is cancelled (e.g. because a vibration event is
-    // received), the `rx.await` below will return, calling `UnregisterWait`
-    // above. Re-assuing `ReadFile` later will not make us lose any reports.
+    let _guard = ReadOverlappedGuard {
+        handle,
+        wait_handle,
+        tx_ptr: tx,
+    };
+
     let rx_result = rx.await;
 
-    unsafe {
-        // UnregisterWait:
-        //
-        // > Even wait operations that use WT_EXECUTEONLYONCE must be canceled.
-        //
-        // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-registerwaitforsingleobject#remarks
-        UnregisterWait(wait_handle);
-    }
-
     if let Err(err) = rx_result {
-        // SAFETY: `tx` originates from `Box::into_raw()`, the wait is no longer
-        // registered (so its reference to `tx` was destroyed). `take_sender`
-        // ensures that no data races between the cancellation of `rx` and the
-        // `Overlapped` callback happened.
-        drop(unsafe { take_sender(tx) });
-
         return Err(err.into());
     }
 
@@ -560,7 +594,11 @@ async fn read_overlapped(
 
 /// Writes `data` to `file` (with `file` an overlapped file).
 fn write_overlapped(handle: HANDLE, data: &[u8]) -> anyhow::Result<()> {
-    let mut overlapped = OVERLAPPED::default();
+    let write_event = unsafe { CreateEventA(null(), false, false, PCSTR::null())? };
+    let mut overlapped = OVERLAPPED {
+        hEvent: write_event,
+        ..Default::default()
+    };
 
     // Start writing.
     let success = unsafe {
@@ -573,22 +611,30 @@ fn write_overlapped(handle: HANDLE, data: &[u8]) -> anyhow::Result<()> {
         )
     };
 
-    anyhow::ensure!(
-        success.as_bool() || Error::last_os_error().raw_os_error() == Some(ERROR_IO_PENDING.0 as _),
-        "cannot write to device: {}",
-        Error::last_os_error(),
-    );
+    let res = if !success.as_bool()
+        && Error::last_os_error().raw_os_error() != Some(ERROR_IO_PENDING.0 as _)
+    {
+        Err(anyhow::anyhow!(
+            "cannot write to device: {}",
+            Error::last_os_error()
+        ))
+    } else {
+        // Wait until we're done writing.
+        let mut written_bytes = 0;
+        let success = unsafe { GetOverlappedResult(handle, &overlapped, &mut written_bytes, true) };
+        if success.as_bool() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "cannot write to device: {}",
+                Error::last_os_error()
+            ))
+        }
+    };
 
-    // Wait until we're done writing.
-    let mut written_bytes = 0;
+    unsafe {
+        CloseHandle(write_event);
+    }
 
-    let success = unsafe { GetOverlappedResult(handle, &overlapped, &mut written_bytes, true) };
-
-    anyhow::ensure!(
-        success.as_bool(),
-        "cannot write to device: {}",
-        Error::last_os_error()
-    );
-
-    Ok(())
+    res
 }
