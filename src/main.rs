@@ -108,8 +108,12 @@ async fn main() -> anyhow::Result<()> {
                     ),
                 );
 
-                assistant_result.context("cannot run Assistant handler")?;
-                capture_result.context("cannot run Capture handler")?;
+                if let Err(err) = assistant_result {
+                    eprintln!("Failed to run Assistant button command: {err}");
+                }
+                if let Err(err) = capture_result {
+                    eprintln!("Failed to run Capture button command: {err}");
+                }
             },
 
             // Forward vibrations from the ViGEm Xbox 360 virtual controller to
@@ -153,9 +157,19 @@ async fn run_button_press(
         .spawn()
         .with_context(|| format!("cannot spawn command '{shell} /C {command_to_run:?}'"))?;
 
-    if let Err(err) = child.wait().await {
-        eprintln!("command '{shell} /C {command_to_run:?}' failed: {err}");
-    }
+    let command_to_run = command_to_run.to_owned();
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) => {
+                if !status.success() {
+                    eprintln!("command '{command_to_run}' exited with non-zero status: {status}");
+                }
+            }
+            Err(err) => {
+                eprintln!("failed to wait for command '{command_to_run}': {err}");
+            }
+        }
+    });
 
     Ok(())
 }

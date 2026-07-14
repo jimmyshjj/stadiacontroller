@@ -71,15 +71,17 @@ impl Controller {
             let inner = match &mut self.inner {
                 Some(inner) => inner,
                 None => loop {
-                    match AcquiredController::acquire()
-                        .context("cannot connect to Stadia controller")?
-                    {
-                        Some(inner) => {
+                    match AcquiredController::acquire() {
+                        Ok(Some(inner)) => {
                             self.inner = Some(inner);
 
                             break unsafe { self.inner.as_mut().unwrap_unchecked() };
                         }
-                        None => {
+                        Ok(None) => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to acquire Stadia controller: {err}. Retrying in 1s...");
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
@@ -88,15 +90,21 @@ impl Controller {
 
             // Read from device; a report is expected to have a size of 11.
             let mut buf = [0; 512];
-            let read_bytes =
-                read_overlapped(inner.device_handle(), &mut inner.overlapped, &mut buf)
-                    .await
-                    .context("cannot read report from Stadia controller")?;
+            let read_result =
+                read_overlapped(inner.device_handle(), &mut inner.overlapped, &mut buf).await;
 
-            let read_bytes = match read_bytes {
-                Some(read_bytes) => read_bytes,
-                None => {
+            let read_bytes = match read_result {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
                     // Controller was disconnected; re-acquire it.
+                    self.inner = None;
+                    self.last_large_motor = 0;
+                    self.last_small_motor = 0;
+
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!("Error reading from Stadia controller: {err}. Re-acquiring...");
                     self.inner = None;
                     self.last_large_motor = 0;
                     self.last_small_motor = 0;
@@ -469,24 +477,10 @@ async fn read_overlapped(
     overlapped: &mut OVERLAPPED,
     buf: &mut [u8],
 ) -> anyhow::Result<Option<usize>> {
-    unsafe fn take_sender(
-        data: *mut (AtomicBool, oneshot::Sender<()>),
-    ) -> Option<oneshot::Sender<()>> {
-        if (*data)
-            .0
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Some(Box::from_raw(data).1);
-        }
-
-        None
-    }
-
     struct ReadOverlappedGuard {
         handle: HANDLE,
         wait_handle: HANDLE,
-        tx_ptr: *mut (AtomicBool, oneshot::Sender<()>),
+        tx_ptr: *mut Option<oneshot::Sender<()>>,
     }
 
     impl Drop for ReadOverlappedGuard {
@@ -496,14 +490,16 @@ async fn read_overlapped(
                 if self.wait_handle.0 != 0 {
                     UnregisterWait(self.wait_handle);
                 }
-                take_sender(self.tx_ptr);
+                drop(Box::from_raw(self.tx_ptr));
             }
         }
     }
 
     unsafe extern "system" fn done_waiting(ctx: *mut c_void, _: BOOLEAN) {
-        let Some(sender) = take_sender(ctx.cast()) else { return };
-        let _ = sender.send(());
+        let box_ptr = ctx as *mut Option<oneshot::Sender<()>>;
+        if let Some(sender) = (*box_ptr).take() {
+            let _ = sender.send(());
+        }
     }
 
     // Reset current event.
@@ -532,7 +528,7 @@ async fn read_overlapped(
     // Start wait for the end of the read; completion will be sent to the
     // current function through a `oneshot` channel.
     let (tx, rx) = oneshot::channel::<()>();
-    let tx = Box::into_raw(Box::new((AtomicBool::new(false), tx)));
+    let tx = Box::into_raw(Box::new(Some(tx)));
     let mut wait_handle = HANDLE(0);
 
     let success = unsafe {
